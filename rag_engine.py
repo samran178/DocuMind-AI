@@ -1,29 +1,44 @@
 """
-rag_engine.py — Core RAG (Retrieval-Augmented Generation) logic for DocuMind AI.
+rag_engine.py — Core RAG logic for DocuMind AI.
 
 Handles PDF loading, text chunking, embedding generation, vector storage,
-and the conversational QA chain setup.
+and the conversational QA chain setup using LangChain 1.x APIs.
 """
 
 import os
 import tempfile
-from typing import List
+from typing import List, Dict, Any
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 
 # ---------------------------------------------------------------------------
-# Prompt: QA — strictly grounded in the retrieved document context
+# Prompts
 # ---------------------------------------------------------------------------
-CUSTOM_QA_PROMPT = PromptTemplate(
-    template="""You are DocuMind AI, a precise and reliable document analysis assistant.
+
+# Step 1: Condense multi-turn follow-ups into a standalone search query
+CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+    ("human",
+     "Given the conversation above, rewrite my latest question as a concise, "
+     "standalone question that captures all necessary context. "
+     "Output only the rewritten question, nothing else."),
+])
+
+# Step 2: Answer strictly from the retrieved document context
+QA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     """You are DocuMind AI, a precise and reliable document analysis assistant.
 
 Use ONLY the following context retrieved from the document to answer the question.
 
@@ -35,31 +50,11 @@ INSTRUCTIONS:
 - If the answer is not in the context, respond exactly with: "I cannot find that in the document."
 - Do NOT make up, infer, or guess information beyond what is explicitly stated.
 - When the context includes page numbers or section metadata, reference them naturally
-  (e.g., "According to page 3, ..." or "In Section 2.1, ...").
-- Keep your answer concise and accurate.
-
-Question: {question}
-
-Answer:""",
-    input_variables=["context", "question"],
-)
-
-# ---------------------------------------------------------------------------
-# Prompt: Condense multi-turn follow-up questions into a standalone query
-# ---------------------------------------------------------------------------
-CONDENSE_QUESTION_PROMPT = PromptTemplate(
-    template="""Given the conversation history below and a follow-up question,
-rephrase the follow-up question as a complete, standalone question that
-captures all necessary context from the history.
-
-Chat History:
-{chat_history}
-
-Follow-up Question: {question}
-
-Standalone Question:""",
-    input_variables=["chat_history", "question"],
-)
+  (e.g., "According to page 3..." or "In Section 2.1...").
+- Keep your answer concise and accurate."""),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
 
 
 def load_and_split_pdf(pdf_bytes: bytes, filename: str) -> List[Document]:
@@ -77,7 +72,6 @@ def load_and_split_pdf(pdf_bytes: bytes, filename: str) -> List[Document]:
     Raises:
         ValueError: If the PDF is empty, unreadable, or contains no text.
     """
-    # PyPDFLoader requires a file path, so write bytes to a temp file first
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -86,16 +80,14 @@ def load_and_split_pdf(pdf_bytes: bytes, filename: str) -> List[Document]:
         loader = PyPDFLoader(tmp_path)
         pages = loader.load()
     finally:
-        os.unlink(tmp_path)  # Always clean up the temp file
+        os.unlink(tmp_path)
 
-    # Guard: nothing was loaded
     if not pages:
         raise ValueError(
             "The PDF appears to be empty or could not be parsed. "
             "Please ensure the file is a valid, non-encrypted PDF."
         )
 
-    # Guard: pages exist but contain no readable text (e.g. scanned image PDF)
     total_text = "".join(p.page_content for p in pages).strip()
     if not total_text:
         raise ValueError(
@@ -104,7 +96,6 @@ def load_and_split_pdf(pdf_bytes: bytes, filename: str) -> List[Document]:
             "Please use a text-based PDF."
         )
 
-    # Split into chunks with overlap to preserve context at boundaries
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
@@ -112,7 +103,6 @@ def load_and_split_pdf(pdf_bytes: bytes, filename: str) -> List[Document]:
     )
     chunks = splitter.split_documents(pages)
 
-    # Attach source filename to each chunk's metadata for citations
     for chunk in chunks:
         chunk.metadata["source_file"] = filename
 
@@ -125,8 +115,7 @@ def build_vector_store(
     persist_dir: str,
 ) -> Chroma:
     """
-    Generate OpenAI embeddings for all chunks and persist them in a local
-    ChromaDB vector store.
+    Generate OpenAI embeddings for all chunks and persist in ChromaDB.
 
     Args:
         chunks:         Document chunks to embed.
@@ -140,7 +129,6 @@ def build_vector_store(
         model="text-embedding-3-small",
         openai_api_key=openai_api_key,
     )
-
     vector_store = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
@@ -152,50 +140,97 @@ def build_vector_store(
 def build_qa_chain(
     vector_store: Chroma,
     openai_api_key: str,
-    memory: ConversationBufferMemory,
-) -> ConversationalRetrievalChain:
+) -> RunnableWithMessageHistory:
     """
-    Assemble a ConversationalRetrievalChain that retrieves the top-4
-    most relevant chunks and passes them — along with conversation history —
-    to GPT-4o-mini for answer generation.
+    Assemble a conversational RAG chain using LangChain 1.x LCEL.
+
+    The chain:
+    1. Condenses the user's question using chat history into a standalone query.
+    2. Retrieves the top-4 most relevant chunks from the vector store.
+    3. Answers strictly from those chunks using GPT-4o-mini.
 
     Args:
         vector_store:   Populated Chroma vector store.
         openai_api_key: OpenAI API key for the LLM.
-        memory:         Shared ConversationBufferMemory instance.
 
     Returns:
-        A ready-to-invoke ConversationalRetrievalChain.
+        A RunnableWithMessageHistory chain ready to invoke with session_id.
     """
     llm = ChatOpenAI(
         model_name="gpt-4o-mini",
-        temperature=0,          # Deterministic, fact-grounded responses
+        temperature=0,
         openai_api_key=openai_api_key,
     )
 
     retriever = vector_store.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 4},  # Retrieve top-4 most relevant chunks
+        search_kwargs={"k": 4},
     )
 
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": CUSTOM_QA_PROMPT},
-        condense_question_prompt=CONDENSE_QUESTION_PROMPT,
-        return_source_documents=True,
-        verbose=False,
+    def format_docs(docs: List[Document]) -> str:
+        parts = []
+        for doc in docs:
+            page = doc.metadata.get("page")
+            page_label = f"[Page {page + 1}]" if page is not None else ""
+            parts.append(f"{page_label}\n{doc.page_content}")
+        return "\n\n---\n\n".join(parts)
+
+    # Step 1: condense question with history → standalone search query
+    condense_chain = CONDENSE_PROMPT | llm | StrOutputParser()
+
+    # Step 2: retrieve relevant docs for the condensed query
+    def retrieve_with_context(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        history = inputs.get("chat_history", [])
+        question = inputs["question"]
+
+        if history:
+            standalone = condense_chain.invoke({
+                "chat_history": history,
+                "question": question,
+            })
+        else:
+            standalone = question
+
+        docs = retriever.invoke(standalone)
+        return {
+            "context": format_docs(docs),
+            "question": question,
+            "chat_history": history,
+            "source_documents": docs,
+        }
+
+    # Full chain: retrieve → answer
+    rag_chain = (
+        RunnablePassthrough.assign(**{"retrieved": retrieve_with_context})
+        | {
+            "answer": (
+                {
+                    "context": lambda x: x["retrieved"]["context"],
+                    "question": lambda x: x["retrieved"]["question"],
+                    "chat_history": lambda x: x["retrieved"]["chat_history"],
+                }
+                | QA_PROMPT
+                | llm
+                | StrOutputParser()
+            ),
+            "source_documents": lambda x: x["retrieved"]["source_documents"],
+        }
     )
-    return chain
+
+    chain_with_history = RunnableWithMessageHistory(
+        rag_chain,
+        lambda session_id: ChatMessageHistory(),  # per-session in-memory history
+        input_messages_key="question",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+
+    return chain_with_history
 
 
 def format_sources(source_docs: List[Document]) -> str:
     """
     Build a deduplicated, human-readable citations block from source documents.
-
-    Deduplicates by (filename, page) so that multiple chunks from the same
-    page are listed only once.
 
     Args:
         source_docs: Source documents returned by the QA chain.
@@ -208,10 +243,8 @@ def format_sources(source_docs: List[Document]) -> str:
 
     for doc in source_docs:
         meta = doc.metadata
-        page = meta.get("page")  # 0-indexed page number from PyPDFLoader
+        page = meta.get("page")
         source = meta.get("source_file", meta.get("source", "Document"))
-
-        # Convert 0-indexed page to 1-indexed for display
         page_label = f"Page {page + 1}" if page is not None else "Unknown page"
         key = (source, page)
 

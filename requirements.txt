@@ -14,3 +14,5 @@ langchain-openai
 pypdf
 streamlit
 tiktoken
+langchain-core
+langchain-text-splitters
