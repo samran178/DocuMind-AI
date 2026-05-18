@@ -1,0 +1,16 @@
+streamlit>=1.32.0
+langchain>=0.2.0
+langchain-openai>=0.1.6
+langchain-community>=0.2.0
+langchain-chroma>=0.1.0
+pypdf>=4.0.0
+chromadb>=0.5.0
+tiktoken>=0.7.0
+chromadb
+langchain
+langchain-chroma
+langchain-community
+langchain-openai
+pypdf
+streamlit
+tiktoken
